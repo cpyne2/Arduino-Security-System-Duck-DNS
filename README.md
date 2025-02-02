@@ -2,4 +2,4 @@ This is a simple security system for door status monitoring based on the Arduino
 
 ![Screenshot](https://github.com/user-attachments/assets/d84c270f-ee0a-4a2b-8519-b7c8cbf0694e)
 
-
+![R4](https://github.com/user-attachments/assets/f4857d69-707c-48d9-bde6-52503e711d7a)
