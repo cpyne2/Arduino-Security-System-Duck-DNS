@@ -50,7 +50,7 @@ char TimeBufferSlider[bufferSize];
 char TimeBufferBasement[bufferSize];
 
 int status = WL_IDLE_STATUS;
-WiFiServer server(80);   // this sets the website port number
+WiFiServer server(81);   // this sets the website port number
 
 #define DOORFRONT_SENSOR_PIN 8 // The Arduino UNO R4 pin connected to door sensor's pin
 int doorFront_state;
