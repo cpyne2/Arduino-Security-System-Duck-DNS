@@ -1,383 +1,358 @@
 /*
-Arduino UNO R4 Security Monitor Sketch
+  Arduino UNO R4 WiFi Security Monitor  
 
-Register with Duck DNS for remote door status montoring via a small webserver over your internet connection.
+  - Door/zone definitions live in ONE table (see "ZONE TABLE" below).
+    Add, remove or rename zones there.
+  - The R4's 12x8 LED matrix scrolls the name(s) of any open zone,
+    e.g.  "OPEN: Front Door, Slider".  Idle = a small heartbeat dot.
+  - "HIGH" = Normally Closed zone. Change to "LOW" in the table for any zones that are normally open.
+  
+  Wiring: each sensor between its pin and GND (pins use INPUT_PULLUP).
 
-This example monitors 4 doors, (Back Door, Slider, Front Door, and Basement Door).   Customize to your needs.
+  Libraries (Library Manager): NTPClient (by Fabrice Weinberg).
+  ArduinoGraphics + Arduino_LED_Matrix + RTC + WiFiS3 ship with the R4 core.
+*/
 
-
- */
-
-#if defined(ARDUINO_PORTENTA_C33)
-#include <WiFiC3.h>
-#elif defined(ARDUINO_UNOWIFIR4)
 #include <WiFiS3.h>
-#endif
-
 #include "RTC.h"
 #include <NTPClient.h>
 #include <WiFiUdp.h>
+#include "ArduinoGraphics.h"      // must come BEFORE Arduino_LED_Matrix.h
+#include "Arduino_LED_Matrix.h"
 
-//Added for Duck DDNS
-#include <SPI.h>
-#include <HttpClient.h>
-//  DDNS
+// ======================= USER SETTINGS =======================
+const char ssid[] = "Your WIFI SSID";
+const char pass[] = "YOUR WIFI PASS";
 
+IPAddress staticIp(192, 168, 0, 99);       // comment out USE_STATIC_IP for DHCP
+#define USE_STATIC_IP
 
-int wifiStatus = WL_IDLE_STATUS;
-WiFiUDP Udp; // A UDP instance to let us send and receive packets over UDP
-NTPClient timeClient(Udp);
+const char* ddnsToken  = "YourDuckDNSToken";
+const char* ddnsDomain = "YourDuckDNSDomain";   // name only, no .duckdns.org
 
-//14400000 milisecond timer = 4hrs.  Sync with the NTP and DDNS on this interval
-#define TIMER_HRS 14400000UL
-unsigned long startTime;
+const int  WEB_PORT          = 81;
+const int  TZ_STD_OFFSET_HOURS = -5;            // standard time offset from UTC (US Eastern = -5)
+const bool USE_US_DST          = true;          // auto-adjust using US rules (2nd Sun Mar -> 1st Sun Nov)
+const unsigned long SYNC_INTERVAL_MS = 4UL * 60UL * 60UL * 1000UL;  // 4 hrs
+const unsigned long DEBOUNCE_MS      = 30;
+const unsigned long SCROLL_STEP_MS   = 70;      // lower = faster scroll
 
-const char ssid[] = "Your SSID";  // change your network SSID (name)
-const char pass[] = "Your WIFI Pass";   // change your network password (use for WPA, or use as key for WEP)
-// Static IP address.  Comment out for DHCP
-IPAddress ip(192, 168, 1, 2);   
+// ======================= ZONE TABLE ==========================
+// name        : shown on the matrix and the web page
+// pin         : Arduino pin the sensor is wired to (other side to GND)
+// openLevel   : pin level that means "open". Reed switch/magnet that opens
+//               when the door opens -> HIGH (pullup pulls it up). For a
+//               normally-closed-to-ground-when-OPEN sensor use LOW.
+struct ZoneConfig {
+  const char* name;
+  uint8_t     pin;
+  uint8_t     openLevel;
+};
 
-const char* token = "YourDuckDNSToken"; // Replace with your DuckDNS token
-const char* domain = "YourDuckDNSDomain"; // Replace with your DuckDNS domain, (name only without duckdns.org)
+const ZoneConfig ZONES[] = {
+  { "Front Door", 8,  HIGH },
+  { "Slider",     9,  HIGH },
+  { "Back Door",  10, HIGH },
+  { "Basement",   11, HIGH },
+  // { "Garage",  12, HIGH },    // <- just add a line
+};
+const size_t ZONE_COUNT = sizeof(ZONES) / sizeof(ZONES[0]);
+// =============================================================
 
-const char dateFormat[] PROGMEM = "    %02d.%02d.%d %02d:%02d:%02d    ";
-const int bufferSize = 300;
-char TimeBufferCurrent[bufferSize];
-char TimeBufferStart[bufferSize];
-char TimeBufferFront[bufferSize];
-char TimeBufferBack[bufferSize];
-char TimeBufferSlider[bufferSize];
-char TimeBufferBasement[bufferSize];
+// Runtime state, one entry per zone (sized automatically from the table)
+struct ZoneState {
+  bool          isOpen;
+  bool          lastRawOpen;
+  unsigned long rawChangedAt;
+  char          lastChange[24];
+};
+ZoneState state[ZONE_COUNT];
 
-int status = WL_IDLE_STATUS;
-WiFiServer server(81);   // this sets the website port number
+char timeNow[24]   = "";
+char timeStart[24] = "";
 
-#define DOORFRONT_SENSOR_PIN 8 // The Arduino UNO R4 pin connected to door sensor's pin
-int doorFront_state;
-int prev_doorFront_state;
+WiFiUDP    udp;
+NTPClient  timeClient(udp);
+WiFiServer server(WEB_PORT);
+ArduinoLEDMatrix matrix;
 
-#define DOORSLIDER_SENSOR_PIN 9 // The Arduino UNO R4 pin connected to door sensor's pin
-int doorSlider_state;
-int prev_doorSlider_state;
+unsigned long lastSync = 0;
+bool          timeValid = false;
 
-#define DOORBACK_SENSOR_PIN 10 // The Arduino UNO R4 pin connected to door sensor's pin
-int doorBack_state;
-int prev_doorBack_state;
+// Scroll-display state
+char          scrollMsg[160] = "";
+int           scrollX = 12;
+int           scrollW = 0;
+unsigned long lastScroll = 0;
+uint32_t      openMask = 0;       // bit per zone (supports up to 32 zones)
+bool          heartbeat = false;
 
-#define DOORBASEMENT_SENSOR_PIN 11 // The Arduino UNO R4 pin connected to door sensor's pin
-int doorBasement_state;
-int prev_doorBasement_state;
-
-float getTemperature() {
-  //return 26.9456;
-  // YOUR SENSOR IMPLEMENTATION HERE
-  // simulate the temperature value
-  float temp_x100 = random(0, 10000);  // a ramdom value from 0 to 10000
-  return temp_x100 / 100;              // return the simulated temperature value from 0 to 100 in float
+// ---------------------------------------------------------------
+// ---- Time zone / DST helpers (the RTC always holds UTC) ----
+// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm)
+long daysFromCivil(int y, int m, int d) {
+  y -= m <= 2;
+  long era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097L + (long)doe - 719468L;
 }
 
-void getDoors() {
-// Watch Doors and record changes
-RTCTime currentTime; 
-RTC.getTime(currentTime);
-
-// ----- Record start time if this is the first run and variable is empty. 
-if (*TimeBufferStart == '\0'){
-      snprintf(TimeBufferStart, bufferSize, dateFormat,
-         Month2int(currentTime.getMonth()), currentTime.getDayOfMonth(), currentTime.getYear(),
-         currentTime.getHour(), currentTime.getMinutes(), currentTime.getSeconds());
-   }
-
-// ------------- DOOR CHECK ----------------------
-prev_doorFront_state = doorFront_state;
-doorFront_state = digitalRead(DOORFRONT_SENSOR_PIN); // read current state
-
-prev_doorSlider_state = doorSlider_state;
-doorSlider_state = digitalRead(DOORSLIDER_SENSOR_PIN); // read current state
-
-prev_doorBack_state = doorBack_state;
-doorBack_state = digitalRead(DOORBACK_SENSOR_PIN); // read current state
-
-prev_doorBasement_state = doorBasement_state;
-doorBasement_state = digitalRead(DOORBASEMENT_SENSOR_PIN); // read current state
-
-// Record time
-snprintf(TimeBufferCurrent, bufferSize, dateFormat,
-         Month2int(currentTime.getMonth()), currentTime.getDayOfMonth(), currentTime.getYear(),
-         currentTime.getHour(), currentTime.getMinutes(), currentTime.getSeconds());
-
-// Door just opened or closed.  Record close time
-if (doorFront_state != prev_doorFront_state){
-      snprintf(TimeBufferFront, bufferSize, dateFormat,
-         Month2int(currentTime.getMonth()), currentTime.getDayOfMonth(), currentTime.getYear(),
-         currentTime.getHour(), currentTime.getMinutes(), currentTime.getSeconds());
-   }
-
-// Door just opened or closed.  Record close time
-if (doorSlider_state != prev_doorSlider_state){
-      snprintf(TimeBufferSlider, bufferSize, dateFormat,
-         Month2int(currentTime.getMonth()), currentTime.getDayOfMonth(), currentTime.getYear(),
-         currentTime.getHour(), currentTime.getMinutes(), currentTime.getSeconds());
-   }
-
-// Door just opened or closed.  Record close time
-if (doorBack_state != prev_doorBack_state){
-      snprintf(TimeBufferBack, bufferSize, dateFormat,
-         Month2int(currentTime.getMonth()), currentTime.getDayOfMonth(), currentTime.getYear(),
-         currentTime.getHour(), currentTime.getMinutes(), currentTime.getSeconds());
-   }
-
-// Door just opened or closed.  Record close time
-if (doorBasement_state != prev_doorBasement_state){
-      snprintf(TimeBufferBasement, bufferSize, dateFormat,
-         Month2int(currentTime.getMonth()), currentTime.getDayOfMonth(), currentTime.getYear(),
-         currentTime.getHour(), currentTime.getMinutes(), currentTime.getSeconds());
-   } 
-
-// ------------- DOOR CHECK ----------------------
+int dayOfWeek(int y, int m, int d) {          // 0 = Sunday
+  return (int)((daysFromCivil(y, m, d) + 4) % 7);
 }
 
-void syncRtcNtp(){
+bool isDST(time_t utc) {
+  if (!USE_US_DST) return false;
+  time_t stdLocal = utc + (time_t)TZ_STD_OFFSET_HOURS * 3600;
+  struct tm tmv;
+  gmtime_r(&stdLocal, &tmv);
+  int y = tmv.tm_year + 1900;
 
-  // ********************* NTP
-  Serial.println("\nStarting connection to server...");
+  int marchDay = 8 + (7 - dayOfWeek(y, 3, 8)) % 7;     // 2nd Sunday in March
+  int novDay   = 1 + (7 - dayOfWeek(y, 11, 1)) % 7;    // 1st Sunday in November
+
+  // DST starts 2:00 local standard time, ends 2:00 local daylight time
+  time_t startUtc = (time_t)daysFromCivil(y, 3, marchDay) * 86400L + 2 * 3600L
+                    - (time_t)TZ_STD_OFFSET_HOURS * 3600L;
+  time_t endUtc   = (time_t)daysFromCivil(y, 11, novDay) * 86400L + 2 * 3600L
+                    - (time_t)(TZ_STD_OFFSET_HOURS + 1) * 3600L;
+  return utc >= startUtc && utc < endUtc;
+}
+
+void formatTime(char* buf, size_t len) {
+  RTCTime t;
+  RTC.getTime(t);
+  time_t utc = (time_t)t.getUnixTime();
+  time_t local = utc + (time_t)(TZ_STD_OFFSET_HOURS + (isDST(utc) ? 1 : 0)) * 3600L;
+  struct tm tmv;
+  gmtime_r(&local, &tmv);
+  snprintf(buf, len, "%02d.%02d.%d %02d:%02d:%02d",
+           tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_year + 1900,
+           tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+}
+
+bool readZoneOpen(size_t i) {
+  return digitalRead(ZONES[i].pin) == ZONES[i].openLevel;
+}
+
+// Debounced scan of every zone. Returns true if any zone changed.
+bool scanZones() {
+  bool changed = false;
+  unsigned long now = millis();
+  for (size_t i = 0; i < ZONE_COUNT; i++) {
+    bool raw = readZoneOpen(i);
+    if (raw != state[i].lastRawOpen) {
+      state[i].lastRawOpen = raw;
+      state[i].rawChangedAt = now;
+    }
+    if (raw != state[i].isOpen && (now - state[i].rawChangedAt) >= DEBOUNCE_MS) {
+      state[i].isOpen = raw;
+      formatTime(state[i].lastChange, sizeof(state[i].lastChange));
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+// ---------------------------------------------------------------
+// LED matrix
+void buildScrollMessage() {
+  scrollMsg[0] = '\0';
+  uint32_t mask = 0;
+  size_t used = snprintf(scrollMsg, sizeof(scrollMsg), "OPEN: ");
+  bool first = true;
+  for (size_t i = 0; i < ZONE_COUNT; i++) {
+    if (!state[i].isOpen) continue;
+    if (i < 32) mask |= (1UL << i);
+    if (used < sizeof(scrollMsg) - 1) {
+      used += snprintf(scrollMsg + used, sizeof(scrollMsg) - used, "%s%s",
+                       first ? "" : ", ", ZONES[i].name);
+    }
+    first = false;
+  }
+  if (mask == 0) scrollMsg[0] = '\0';
+  openMask = mask;
+  scrollW = strlen(scrollMsg) * 4;     // Font_4x6 ~ 4 px per character
+  scrollX = 12;                        // start just off the right edge
+}
+
+void drawFrame() {
+  matrix.beginDraw();
+  matrix.clear();
+  matrix.stroke(0xFFFFFFFF);
+  if (scrollMsg[0]) {
+    matrix.textFont(Font_4x6);
+    matrix.text(scrollMsg, scrollX, 1);
+  } else if (heartbeat) {
+    matrix.point(0, 0);                // idle heartbeat in the corner
+  }
+  matrix.endDraw();
+}
+
+void updateDisplay() {
+  unsigned long now = millis();
+  if (now - lastScroll < SCROLL_STEP_MS) return;
+  lastScroll = now;
+
+  if (scrollMsg[0]) {
+    drawFrame();
+    if (--scrollX < -scrollW) scrollX = 12;   // loop
+  } else {
+    // idle: blink once per ~1 s (every 14 steps at 70 ms)
+    static uint8_t tick = 0;
+    if (++tick >= 14) { tick = 0; heartbeat = !heartbeat; drawFrame(); }
+  }
+}
+
+// ---------------------------------------------------------------
+// Network / time
+void syncRtcNtp() {
   timeClient.begin();
-  timeClient.update();
-
-  // Get the current date and time from an NTP server and convert
-  // it to UTC by passing the time zone offset in hours.
-  // You may change the time zone offset to your local one.
-  auto timeZoneOffsetHours = -5;
-  auto unixTime = timeClient.getEpochTime() + (timeZoneOffsetHours * 3600);
-  Serial.print("Unix time = ");
-  Serial.println(unixTime);
-  RTCTime timeToSet = RTCTime(unixTime);
-  RTC.setTime(timeToSet);
-
-  // Retrieve the date and time from the RTC and print them
-  RTCTime currentTime;
-  RTC.getTime(currentTime); 
-  Serial.println("The RTC was just set to: " + String(currentTime));
-//  *********************   NTP
-
+  if (timeClient.update() || timeClient.forceUpdate()) {
+    RTCTime t((time_t)timeClient.getEpochTime());   // NTP time is UTC
+    RTC.setTime(t);
+    timeValid = true;
+    Serial.println("RTC synced to NTP");
+  } else {
+    Serial.println("NTP sync failed");
+  }
 }
 
-void syncDuckDNS(){
+void syncDuckDNS() {
+  WiFiClient client;
+  if (!client.connect("www.duckdns.org", 80)) {
+    Serial.println("DuckDNS connect failed");
+    return;
+  }
+  client.print("GET /update?domains=");
+  client.print(ddnsDomain);
+  client.print("&token=");
+  client.print(ddnsToken);
+  client.println("&verbose=true HTTP/1.1");
+  client.println("Host: www.duckdns.org");
+  client.println("Connection: close");
+  client.println();
 
-  // DDNS
-WiFiClient client;  //changed to Wifi
-HttpClient http(client, "www.duckdns.org", 80);
-  // Make a HTTP request:
-String url = "/update?domains=" + String(domain) + "&token=" + String(token) + "&verbose=true";
-http.get(url);
-// Read the response
-int statusCode = http.responseStatusCode();
-String response = http.responseBody();
-
-Serial.print("Status code: ");
-Serial.println(statusCode);
-Serial.print("Response: ");
-Serial.println(response);
-
-//DDNS
-
+  // Print the reply (body contains OK/KO), give up after 5 seconds
+  unsigned long t0 = millis();
+  while ((client.connected() || client.available()) && millis() - t0 < 5000) {
+    while (client.available()) Serial.write(client.read());
+  }
+  Serial.println();
+  client.stop();
 }
 
-void setup() {
-  //Initialize serial and wait for port to open:
-  Serial.begin(9600);
-  while (!Serial);
-
-  //start recording timeer from startup
-  startTime = millis();
-
-  connectToWiFi();
-
-  syncDuckDNS();
-
-  RTC.begin();
-  syncRtcNtp();
- 
-  pinMode(DOORFRONT_SENSOR_PIN, INPUT_PULLUP); // set arduino pin to input pull-up mode
-  pinMode(DOORSLIDER_SENSOR_PIN, INPUT_PULLUP); // set arduino pin to input pull-up mode
-  pinMode(DOORBACK_SENSOR_PIN, INPUT_PULLUP); // set arduino pin to input pull-up mode
-  pinMode(DOORBASEMENT_SENSOR_PIN, INPUT_PULLUP); // set arduino pin to input pull-up mode
-
-}
-
-void connectToWiFi(){
-
-    String fv = WiFi.firmwareVersion();
-  if (fv < WIFI_FIRMWARE_LATEST_VERSION)
-    Serial.println("Please upgrade the firmware");
-
-//Set a static IP
-  WiFi.config(ip);
-
-  // attempt to connect to WiFi network:
+void connectToWiFi() {
+  if (String(WiFi.firmwareVersion()) < String(WIFI_FIRMWARE_LATEST_VERSION)) {
+    Serial.println("Please upgrade the WiFi firmware");
+  }
+#ifdef USE_STATIC_IP
+  WiFi.config(staticIp);
+#endif
+  int status = WL_IDLE_STATUS;
   while (status != WL_CONNECTED) {
-    Serial.print("Attempting to connect to SSID: ");
+    Serial.print("Connecting to ");
     Serial.println(ssid);
-    // Connect to WPA/WPA2 network. Change this line if using open or WEP network:
     status = WiFi.begin(ssid, pass);
-
-    // wait 10 seconds for connection:
-    delay(10000);
+    if (status != WL_CONNECTED) delay(5000);
   }
   server.begin();
-  // you're connected now, so print out the status:
-  printWifiStatus();
-
-}
-
-void loop() {
-
-// Continuously watch the doors for status changes
-getDoors();
-
-//  -------  Timer - Sync the RTC to NTP and DDNS every 4 hrs -----------
-if (millis() - startTime > TIMER_HRS)
-  {
-    syncRtcNtp();
-    syncDuckDNS();
-    startTime = millis();
-  }
-//  -------  Timer - Sync the RTC to NTP every 4 hrs -----------
-
-  // listen for incoming clients
-  WiFiClient client = server.available();
-  if (client) {
-    // read the HTTP request header line by line
-    while (client.connected()) {
-      if (client.available()) {
-        String HTTP_header = client.readStringUntil('\n');  // read the header line of HTTP request
-
-        if (HTTP_header.equals("\r"))  // the end of HTTP request
-          break;
-
-        Serial.print("<< ");
-        Serial.println(HTTP_header);  // print HTTP request to Serial Monitor
-      }
-    }
-
-    // send the HTTP response
-    // send the HTTP response header
-    client.println("HTTP/1.1 200 OK");
-    client.println("Content-Type: text/html");
-    client.println("Connection: close");  // the connection will be closed after completion of the response
-    client.println();                     // the separator between HTTP header and body
-    // send the HTTP response body
-    client.println("<!DOCTYPE HTML>");
-    client.println("<html>");
-    client.println("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">");  // Adjusts size for viewing on a phone
-
-    client.println("<head>");
-    client.println("<link rel=\"icon\" href=\"data:,\">");
-    client.println("</head>");
-
-    client.println("<p>");
-
-    client.print("Current Time: <span style=\"color: red;\">");
-    client.print(TimeBufferCurrent);
-    client.println("</span>");
-    
-    client.println("<p>");
-
-    client.print("Start Time: <span style=\"color: red;\">");
-    client.print(TimeBufferStart);
-    client.println("</span>");
-    
-   // client.print("Temperature: <span style=\"color: red;\">");
-   // float temperature = getTemperature();
-   // client.print(temperature, 2);
-   // client.println("&deg;C</span>");
-
-    client.println("</p>");
-
-//  #################   Display DOORS  ################
-    client.println("<p>");
-
-    //Check door last time changes
-    getDoors();
-
-    client.print("Front Door : ");
-      doorFront_state = digitalRead(DOORFRONT_SENSOR_PIN); // read current state
-
-    if (doorFront_state == HIGH) {
-      client.println("<span style=\"color: red;\"> Open: ");
-      client.println(TimeBufferFront);
-    } else {
-      client.println("Closed: ");
-      client.println(TimeBufferFront);
-    }
-
-    client.println("</span>");
-    client.println("</p>");
-
-    client.print("Slider Door : ");
-      doorSlider_state = digitalRead(DOORSLIDER_SENSOR_PIN); // read current state
-
-    if (doorSlider_state == HIGH) {
-      client.println("<span style=\"color: red;\"> Open: ");
-      client.println(TimeBufferSlider);
-    } else {
-      client.println("Closed: ");
-      client.println(TimeBufferSlider);
-    }
-
-    client.println("</span>");
-    client.println("</p>");
-  
-    client.print("Back Door : ");
-      doorBack_state = digitalRead(DOORBACK_SENSOR_PIN); // read current state
-
-    if (doorBack_state == HIGH) {
-      client.println("<span style=\"color: red;\"> Open: ");
-      client.println(TimeBufferBack);
-    } else {
-      client.println("Closed: ");
-      client.println(TimeBufferBack);
-    }
-
-    client.println("</span>");
-    client.println("</p>");
-
-    client.print("Basement Door : ");
-      doorBasement_state = digitalRead(DOORBASEMENT_SENSOR_PIN); // read current state
-
-    if (doorBasement_state == HIGH) {
-      client.println("<span style=\"color: red;\"> Open: ");
-      client.println(TimeBufferBasement);
-    } else {
-      client.println("Closed: ");
-      client.println(TimeBufferBasement);
-    }
-
-    client.println("</span>");
-    client.println("</p>");
-
-//  #################   END Display DOORS  ################
-
-    client.println("</html>");
-    client.flush();
-
-    // give the web browser time to receive the data
-    delay(10);
-
-    // close the connection:
-    client.stop();
-
-  }
-}
-
-void printWifiStatus() {
-  // print your board's IP address:
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-
-  // print the received signal strength:
-  Serial.print("signal strength (RSSI):");
+  Serial.print("IP: ");
+  Serial.print(WiFi.localIP());
+  Serial.print("  RSSI: ");
   Serial.print(WiFi.RSSI());
   Serial.println(" dBm");
 }
-  
+
+// ---------------------------------------------------------------
+// Web page
+void sendPage(WiFiClient& client) {
+  formatTime(timeNow, sizeof(timeNow));
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+  client.println("<!DOCTYPE HTML><html><head>");
+  client.println("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">");
+  client.println("<link rel=\"icon\" href=\"data:,\">");
+  client.println("</head><body>");
+
+  client.print("<p>Current Time: <span style=\"color:red;\">");
+  client.print(timeNow);
+  client.println("</span></p>");
+  client.print("<p>Start Time: <span style=\"color:red;\">");
+  client.print(timeStart);
+  client.println("</span></p>");
+
+  for (size_t i = 0; i < ZONE_COUNT; i++) {
+    client.print("<p>");
+    client.print(ZONES[i].name);
+    client.print(" : ");
+    if (state[i].isOpen) client.print("<span style=\"color:red;\">Open: ");
+    else                 client.print("<span>Closed: ");
+    client.print(state[i].lastChange);
+    client.println("</span></p>");
+  }
+  client.println("</body></html>");
+}
+
+void handleClient() {
+  WiFiClient client = server.available();
+  if (!client) return;
+
+  unsigned long t0 = millis();
+  while (client.connected() && millis() - t0 < 1000) {
+    if (client.available()) {
+      String line = client.readStringUntil('\n');
+      if (line.equals("\r")) break;          // end of request headers
+    }
+  }
+  sendPage(client);
+  client.flush();
+  delay(10);
+  client.stop();
+}
+
+// ---------------------------------------------------------------
+void setup() {
+  Serial.begin(9600);
+  unsigned long t0 = millis();
+  while (!Serial && millis() - t0 < 2000);   // don't hang when USB isn't connected
+
+  matrix.begin();
+
+  for (size_t i = 0; i < ZONE_COUNT; i++) {
+    pinMode(ZONES[i].pin, INPUT_PULLUP);
+    bool o = readZoneOpen(i);
+    state[i].isOpen = state[i].lastRawOpen = o;
+    state[i].rawChangedAt = millis();
+    strcpy(state[i].lastChange, "since boot");
+  }
+
+  connectToWiFi();
+  RTC.begin();
+  syncRtcNtp();
+  syncDuckDNS();
+  lastSync = millis();
+
+  formatTime(timeStart, sizeof(timeStart));
+  buildScrollMessage();                      // show any zone already open at boot
+}
+
+void loop() {
+  if (scanZones()) buildScrollMessage();     // only rebuild text on a change
+
+  updateDisplay();
+
+  if (millis() - lastSync > SYNC_INTERVAL_MS) {
+    if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+    syncRtcNtp();
+    syncDuckDNS();
+    lastSync = millis();
+  }
+
+  handleClient();
+}
