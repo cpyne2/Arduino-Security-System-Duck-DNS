@@ -1,16 +1,17 @@
 /*
-  Arduino UNO R4 WiFi Security Monitor  
+  Arduino UNO R4 WiFi Security Monitor  (optimized)
 
   - Door/zone definitions live in ONE table (see "ZONE TABLE" below).
-    Add, remove or rename zones there.
+    Add, remove or rename zones there; nothing else needs to change.
   - The R4's 12x8 LED matrix scrolls the name(s) of any open zone,
-    e.g.  "OPEN: Front Door, Slider".  Idle = a small heartbeat dot.
-  - "HIGH" = Normally Closed zone. Change to "LOW" in the table for any zones that are normally open.
-  
+    e.g.  "OPEN: Front Door, Slider".  Idle = a small blinking dot.
+  - Same web page / Duck DNS / NTP behavior as the original sketch.
+
   Wiring: each sensor between its pin and GND (pins use INPUT_PULLUP).
 
-  Libraries (Library Manager): NTPClient (by Fabrice Weinberg).
-  ArduinoGraphics + Arduino_LED_Matrix + RTC + WiFiS3 ship with the R4 core.
+  Libraries (Library Manager): NTPClient (by Fabrice Weinberg) and
+  ArduinoGraphics (by Arduino).
+  WiFiS3, RTC and Arduino_LED_Matrix ship with the UNO R4 board core.
 */
 
 #include <WiFiS3.h>
@@ -21,28 +22,31 @@
 #include "Arduino_LED_Matrix.h"
 
 // ======================= USER SETTINGS =======================
-const char ssid[] = "Your WIFI SSID";
-const char pass[] = "YOUR WIFI PASS";
+const char ssid[] = "YOUR SSID";
+const char pass[] = "YOUR WIFI PASSWORD";
 
-IPAddress staticIp(192, 168, 0, 99);       // comment out USE_STATIC_IP for DHCP
+IPAddress staticIp(192, 168, 1, 2);       // comment out USE_STATIC_IP for DHCP
 #define USE_STATIC_IP
 
-const char* ddnsToken  = "YourDuckDNSToken";
-const char* ddnsDomain = "YourDuckDNSDomain";   // name only, no .duckdns.org
+const char* ddnsToken  = "YOUR DUCKDNS TOKEN";
+const char* ddnsDomain = "YOUR DUCKDNS SITE";   // name only, no .duckdns.org
 
 const int  WEB_PORT          = 81;
 const int  TZ_STD_OFFSET_HOURS = -5;            // standard time offset from UTC (US Eastern = -5)
 const bool USE_US_DST          = true;          // auto-adjust using US rules (2nd Sun Mar -> 1st Sun Nov)
 const unsigned long SYNC_INTERVAL_MS = 4UL * 60UL * 60UL * 1000UL;  // 4 hrs
 const unsigned long DEBOUNCE_MS      = 30;
-const unsigned long SCROLL_STEP_MS   = 70;      // lower = faster scroll
+
+// Display settings
+const unsigned long SCROLL_STEP_MS = 70;  // lower = faster scrolling
 
 // ======================= ZONE TABLE ==========================
-// name        : shown on the matrix and the web page
+// name        : shown on the web page
 // pin         : Arduino pin the sensor is wired to (other side to GND)
 // openLevel   : pin level that means "open". Reed switch/magnet that opens
 //               when the door opens -> HIGH (pullup pulls it up). For a
-//               normally-closed-to-ground-when-OPEN sensor use LOW.
+//               sensor that closes to ground when OPEN use LOW.
+// Zone numbers are simply the row position: first row = zone 1, etc.
 struct ZoneConfig {
   const char* name;
   uint8_t     pin;
@@ -50,11 +54,11 @@ struct ZoneConfig {
 };
 
 const ZoneConfig ZONES[] = {
-  { "Front Door", 8,  HIGH },
-  { "Slider",     9,  HIGH },
-  { "Back Door",  10, HIGH },
-  { "Basement",   11, HIGH },
-  // { "Garage",  12, HIGH },    // <- just add a line
+  { "Front Door", 8,  HIGH },   // zone 1
+  { "Slider",     9,  HIGH },   // zone 2
+  { "Back Door",  10, HIGH },   // zone 3
+  { "Basement",   11, HIGH },   // zone 4
+  // { "Garage",  12, HIGH },   // zone 5  <- just add a line
 };
 const size_t ZONE_COUNT = sizeof(ZONES) / sizeof(ZONES[0]);
 // =============================================================
@@ -79,15 +83,11 @@ ArduinoLEDMatrix matrix;
 unsigned long lastSync = 0;
 bool          timeValid = false;
 
-// Scroll-display state
-char          scrollMsg[160] = "";
-int           scrollX = 12;
-int           scrollW = 0;
-unsigned long lastScroll = 0;
-uint32_t      openMask = 0;       // bit per zone (supports up to 32 zones)
-bool          heartbeat = false;
+// Character shown for a zone: 1-9, then A, B, C ...
+char zoneLabel(size_t i) {
+  return (i < 9) ? (char)('1' + i) : (char)('A' + (i - 9));
+}
 
-// ---------------------------------------------------------------
 // ---- Time zone / DST helpers (the RTC always holds UTC) ----
 // Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm)
 long daysFromCivil(int y, int m, int d) {
@@ -133,6 +133,8 @@ void formatTime(char* buf, size_t len) {
            tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 }
 
+// ---------------------------------------------------------------
+// Zone scanning
 bool readZoneOpen(size_t i) {
   return digitalRead(ZONES[i].pin) == ZONES[i].openLevel;
 }
@@ -157,23 +159,27 @@ bool scanZones() {
 }
 
 // ---------------------------------------------------------------
-// LED matrix
+// LED matrix: scrolling text listing the open zones
+char          scrollMsg[160] = "";
+int           scrollX = 12;
+int           scrollW = 0;
+unsigned long lastScroll = 0;
+bool          heartbeat = false;
+
+// Rebuild "OPEN: Front Door, Slider" from the current zone states
 void buildScrollMessage() {
   scrollMsg[0] = '\0';
-  uint32_t mask = 0;
-  size_t used = snprintf(scrollMsg, sizeof(scrollMsg), "OPEN: ");
+  size_t used = 0;
   bool first = true;
   for (size_t i = 0; i < ZONE_COUNT; i++) {
     if (!state[i].isOpen) continue;
-    if (i < 32) mask |= (1UL << i);
-    if (used < sizeof(scrollMsg) - 1) {
-      used += snprintf(scrollMsg + used, sizeof(scrollMsg) - used, "%s%s",
-                       first ? "" : ", ", ZONES[i].name);
-    }
+    if (used >= sizeof(scrollMsg) - 1) break;
+    int n;
+    if (first) n = snprintf(scrollMsg, sizeof(scrollMsg), "OPEN: %s", ZONES[i].name);
+    else       n = snprintf(scrollMsg + used, sizeof(scrollMsg) - used, ", %s", ZONES[i].name);
+    if (n > 0) used += n;
     first = false;
   }
-  if (mask == 0) scrollMsg[0] = '\0';
-  openMask = mask;
   scrollW = strlen(scrollMsg) * 4;     // Font_4x6 ~ 4 px per character
   scrollX = 12;                        // start just off the right edge
 }
@@ -204,6 +210,23 @@ void updateDisplay() {
     static uint8_t tick = 0;
     if (++tick >= 14) { tick = 0; heartbeat = !heartbeat; drawFrame(); }
   }
+}
+
+// Scroll a message across the matrix once (blocking; used only at boot)
+void scrollOnce(const char* msg) {
+  int w = strlen(msg) * 4;
+  matrix.textFont(Font_4x6);
+  for (int x = 12; x >= -w; x--) {
+    matrix.beginDraw();
+    matrix.clear();
+    matrix.stroke(0xFFFFFFFF);
+    matrix.text(msg, x, 1);
+    matrix.endDraw();
+    delay(SCROLL_STEP_MS);
+  }
+  matrix.beginDraw();
+  matrix.clear();
+  matrix.endDraw();
 }
 
 // ---------------------------------------------------------------
@@ -268,35 +291,99 @@ void connectToWiFi() {
 
 // ---------------------------------------------------------------
 // Web page
+// One "label ... value" row of the info card
+void infoRow(WiFiClient& client, const char* label, const char* value) {
+  client.print("<div class=\"row\"><span class=\"label\">");
+  client.print(label);
+  client.print("</span><span class=\"value\">");
+  client.print(value);
+  client.println("</span></div>");
+}
+
 void sendPage(WiFiClient& client) {
   formatTime(timeNow, sizeof(timeNow));
 
+  size_t openCount = 0;
+  for (size_t i = 0; i < ZONE_COUNT; i++) if (state[i].isOpen) openCount++;
+
   client.println("HTTP/1.1 200 OK");
-  client.println("Content-Type: text/html");
+  client.println("Content-Type: text/html; charset=utf-8");
   client.println("Connection: close");
   client.println();
-  client.println("<!DOCTYPE HTML><html><head>");
-  client.println("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">");
-  client.println("<link rel=\"icon\" href=\"data:,\">");
-  client.println("</head><body>");
 
-  client.print("<p>Current Time: <span style=\"color:red;\">");
-  client.print(timeNow);
-  client.println("</span></p>");
-  client.print("<p>Start Time: <span style=\"color:red;\">");
-  client.print(timeStart);
-  client.println("</span></p>");
+  // Styles: grey labels, blue values, red = open/alarm, green = closed/ok.
+  // Light and dark mode follow the viewer's device setting.
+  client.print(R"HTML(<!DOCTYPE HTML><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:,">
+<title>Security Monitor</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--text:#1d2530;--label:#5f6b7a;--value:#0b5cad;
+--ok:#1b7f3b;--okbg:#e6f4ea;--alarm:#c62828;--alarmbg:#fdecea;--line:#e3e8ee}
+@media(prefers-color-scheme:dark){:root{--bg:#12161b;--card:#1b2129;--text:#e6ebf1;
+--label:#9aa7b5;--value:#6cb2ff;--ok:#5fd37f;--okbg:#17301f;--alarm:#ff6b6b;
+--alarmbg:#3a1a1a;--line:#2a323c}}
+body{font-family:system-ui,Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:16px}
+.wrap{max-width:520px;margin:0 auto}
+h1{font-size:1.25rem;margin:0 0 12px}
+.banner{padding:12px 14px;border-radius:10px;font-weight:700;margin-bottom:12px}
+.banner.ok{background:var(--okbg);color:var(--ok)}
+.banner.alarm{background:var(--alarm);color:#fff}
+.card{background:var(--card);border-radius:10px;padding:2px 14px;margin-bottom:12px;
+box-shadow:0 1px 3px rgba(0,0,0,.15)}
+.row{display:flex;justify-content:space-between;align-items:center;gap:12px;
+padding:10px 0;border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:0}
+.label{color:var(--label)}
+.value{color:var(--value);font-weight:600;text-align:right}
+.zone.open{background:var(--alarmbg);margin:0 -14px;padding:10px 14px}
+.num{display:inline-block;min-width:1.6em;text-align:center;border-radius:5px;
+background:var(--line);color:var(--label);font-weight:700;margin-right:8px}
+.name{font-weight:600}
+.right{text-align:right}
+.state{display:block;font-weight:800;letter-spacing:.04em}
+.state.open{color:var(--alarm)}
+.state.closed{color:var(--ok)}
+.when{display:block;font-size:.85rem;color:var(--value)}
+</style></head><body><div class="wrap">
+<h1>Security Monitor</h1>
+)HTML");
 
-  for (size_t i = 0; i < ZONE_COUNT; i++) {
-    client.print("<p>");
-    client.print(ZONES[i].name);
-    client.print(" : ");
-    if (state[i].isOpen) client.print("<span style=\"color:red;\">Open: ");
-    else                 client.print("<span>Closed: ");
-    client.print(state[i].lastChange);
-    client.println("</span></p>");
+  if (openCount == 0) {
+    client.println("<div class=\"banner ok\">&#10003; All zones closed</div>");
+  } else {
+    client.print("<div class=\"banner alarm\">&#9888; ");
+    client.print(openCount);
+    client.println(openCount == 1 ? " zone open</div>" : " zones open</div>");
   }
-  client.println("</body></html>");
+
+  // Info card
+  client.println("<div class=\"card\">");
+  infoRow(client, "Current Time", timeNow);
+  infoRow(client, "Start Time", timeStart);
+  String ipPort = WiFi.localIP().toString() + ":" + String(WEB_PORT);
+  infoRow(client, "Local IP", ipPort.c_str());
+  client.println("</div>");
+
+  // Zone card
+  client.println("<div class=\"card\">");
+  for (size_t i = 0; i < ZONE_COUNT; i++) {
+    bool o = state[i].isOpen;
+    client.print(o ? "<div class=\"row zone open\">" : "<div class=\"row zone\">");
+    client.print("<span><span class=\"num\">");
+    client.print(zoneLabel(i));
+    client.print("</span><span class=\"name\">");
+    client.print(ZONES[i].name);
+    client.print("</span></span><span class=\"right\">");
+    client.print(o ? "<span class=\"state open\">OPEN</span>"
+                   : "<span class=\"state closed\">Closed</span>");
+    client.print("<span class=\"when\">");
+    client.print(state[i].lastChange);
+    client.println("</span></span></div>");
+  }
+  client.println("</div>");
+  client.println("</div></body></html>");
 }
 
 void handleClient() {
@@ -333,6 +420,10 @@ void setup() {
   }
 
   connectToWiFi();
+  char ipMsg[32];
+  snprintf(ipMsg, sizeof(ipMsg), "IP %s", WiFi.localIP().toString().c_str());
+  scrollOnce(ipMsg);                         // show the IP on the matrix at boot
+
   RTC.begin();
   syncRtcNtp();
   syncDuckDNS();
@@ -344,7 +435,6 @@ void setup() {
 
 void loop() {
   if (scanZones()) buildScrollMessage();     // only rebuild text on a change
-
   updateDisplay();
 
   if (millis() - lastSync > SYNC_INTERVAL_MS) {
